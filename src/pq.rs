@@ -48,8 +48,11 @@ impl PartialOrd for LentEntry {
     }
 }
 
+/// Очередь с приоритетами
 pub struct PQueue {
+    /// Номер следующего добавляемого элемента
     serial: u64,
+    /// Сами элементы храним в куче
     queue: BinaryHeap<PQueueEntry>,
     lentm: HashMap<Key, LendSnapshot>,
     lentq: BinaryHeap<LentEntry>,
@@ -67,6 +70,7 @@ impl Default for PQueue {
 }
 
 impl PQueue {
+    /// Создаем новую пустую очередь
     pub fn new() -> PQueue {
         PQueue::default()
     }
@@ -79,8 +83,11 @@ impl PQueue {
         self.queue.is_empty()
     }
 
+    /// Добавляем нужный элемент в нашу очередь для работы
     pub fn add(&mut self, key: Key, mode: AddMode) {
+        // Номер следующего
         self.serial += 1;
+        // Сохраняем в кучу с ключем, приоритетом
         self.queue.push(PQueueEntry {
             key,
             priority: match mode { AddMode::Head => 0, AddMode::Tail => self.serial, },

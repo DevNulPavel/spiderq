@@ -68,72 +68,122 @@ impl From<db::Error> for Error {
     }
 }
 
+/// Непосредственно запуск нашего приложения с параметрами
 pub fn bootstrap(maybe_matches: getopts::Result) -> Result<(zmq::Context, JoinHandle<()>), Error> {
+    // Разворачиваем параметры приложения
     let matches = maybe_matches.map_err(Error::Getopts)?;
+
+    // Получаем путь к базе данных
     let database_dir = matches.opt_str("database").unwrap_or_else(|| "./spiderq".to_owned());
+    // Получаем адрес ZeroMQ сокета
     let zmq_addr = matches.opt_str("zmq-addr").unwrap_or_else(|| "ipc://./spiderq.ipc".to_owned());
+    // Получаем лимит элементов в очереди, при которых сбрасываем данные на диск
     let flush_limit: usize = matches.opt_str("flush-limit").unwrap_or_else(|| "131072".to_owned()).parse().map_err(Error::InvalidFlushLimit)?;
+    
+    // Фиксим путь к ZeroMQ очереди
     let zmq_addr_cloned = zmq_addr.replace("//*:", "//127.0.0.1:");
+
+    // Назначаем обработчик различных системных прерываний
     simple_signal::set_handler(&[Signal::Hup, Signal::Int, Signal::Quit, Signal::Abrt, Signal::Term], move |signals| {
+        // Создаем контекст ZMQ
         let zmq_ctx = zmq::Context::new();
+
+        // Создаем сокет типа REQ для отправки в очередь команды
         let sock = zmq_ctx.socket(zmq::REQ).map_err(ZmqError::Socket).unwrap();
+        
+        // Коннектимся по адресу текущего процесса
         sock.connect(&zmq_addr_cloned).map_err(ZmqError::Connect).unwrap();
+
         println!(" ;; {:?} received, terminating server...", signals);
+
+        // Создаем ProtoBuf сообщение с запросом завершения работы
         let packet = GlobalReq::Terminate;
         let required = packet.encode_len();
         let mut msg = zmq::Message::with_capacity(required)
             .map_err(ZmqError::Message)
             .unwrap();
         packet.encode(&mut msg);
+
+        // Отправляем в ZMQ сообщение завершения работы
         sock.send_msg(msg, 0).unwrap();
+
+        // Затем ждем ответный статус
         let reply_msg = sock.recv_msg(0).map_err(ZmqError::Recv).unwrap();
         let (rep, _) = GlobalRep::decode(&reply_msg).unwrap();
+
+        // Если успешно все завершилось - тогда все ок, если нет - паникуем
         match rep {
             GlobalRep::Terminated => (),
             other => panic!("unexpected reply for terminate: {:?}", other),
         }
     });
+
+    // Стартуем наш сервис с параметрами
     entrypoint(&zmq_addr, &database_dir, flush_limit)
 }
 
+/// Стартуем наш сервис с параметрами
 pub fn entrypoint(zmq_addr: &str, database_dir: &str, flush_limit: usize) -> Result<(zmq::Context, JoinHandle<()>), Error> {
+    // Открываем нашу базу данных по пути из параметров с лимитом на максимальное количество элементов перед сбросом на диск
     let db = db::Database::new(database_dir, flush_limit).map_err(Error::Db)?;
+
+    // Создаем priority-очередь
     let mut pq = pq::PQueue::new();
-    // initially fill pq
+
+    // Из базы данных заполняем данные снова в очередь
     for (k, _) in db.iter() {
         pq.add(k.clone(), AddMode::Tail)
     }
 
+    // Создаем контекст для работы с ZeroMQ
     let ctx = zmq::Context::new();
+    // Создаем сокет типа роутер
     let sock_master_ext = ctx.socket(zmq::ROUTER).map_err(ZmqError::Socket).map_err(Error::Zmq)?;
+    // Сокеты для получения данных для базы данных + очереди
     let sock_master_db_rx = ctx.socket(zmq::PULL).map_err(ZmqError::Socket).map_err(Error::Zmq)?;
     let sock_master_pq_rx = ctx.socket(zmq::PULL).map_err(ZmqError::Socket).map_err(Error::Zmq)?;
+    // Сокеты для отправки в базу + в очередь с приоритетами
     let sock_db_master_tx = ctx.socket(zmq::PUSH).map_err(ZmqError::Socket).map_err(Error::Zmq)?;
     let sock_pq_master_tx = ctx.socket(zmq::PUSH).map_err(ZmqError::Socket).map_err(Error::Zmq)?;
 
+    // Роутеру назначаем переданный адрес
     sock_master_ext.bind(zmq_addr).map_err(ZmqError::Bind).map_err(Error::Zmq)?;
+    // Всем остальным назначаем сокеты межпроцессного взаимодействия
     sock_master_db_rx.bind("inproc://db_rxtx").map_err(ZmqError::Bind).map_err(Error::Zmq)?;
     sock_db_master_tx.connect("inproc://db_rxtx").map_err(ZmqError::Connect).map_err(Error::Zmq)?;
     sock_master_pq_rx.bind("inproc://pq_rxtx").map_err(ZmqError::Bind).map_err(Error::Zmq)?;
     sock_pq_master_tx.connect("inproc://pq_rxtx").map_err(ZmqError::Connect).map_err(Error::Zmq)?;
 
+    // Создаем небуферизированные Rust-каналы для взаимодействия
+    // TODO: может быть сделать каналы ограниченного размера
     let (chan_master_db_tx, chan_db_master_rx) = channel();
     let (chan_db_master_tx, chan_master_db_rx) = channel();
     let (chan_master_pq_tx, chan_pq_master_rx) = channel();
     let (chan_pq_master_tx, chan_master_pq_rx) = channel();
 
+    // Создаем поток для работы в базой данных
     Builder::new().name("worker_db".to_owned())
-        .spawn(move || worker_db(sock_db_master_tx, chan_db_master_tx, chan_db_master_rx, db).unwrap()).unwrap();
+        .spawn(move || {
+            worker_db(sock_db_master_tx, chan_db_master_tx, chan_db_master_rx, db).unwrap()
+        }).unwrap();
+
+    // Создаем поток для работы с очередью
     Builder::new().name("worker_pq".to_owned())
-        .spawn(move || worker_pq(sock_pq_master_tx, chan_pq_master_tx, chan_pq_master_rx, pq).unwrap()).unwrap();
+        .spawn(move || {
+            worker_pq(sock_pq_master_tx, chan_pq_master_tx, chan_pq_master_rx, pq).unwrap()
+        }).unwrap();
+
+    // Создаем мастер-поток контроля работы
     let master_thread = Builder::new().name("master".to_owned())
-   	.spawn(move || master(sock_master_ext,
-                              sock_master_db_rx,
-                              sock_master_pq_rx,
-                              chan_master_db_tx,
-                              chan_master_db_rx,
-                              chan_master_pq_tx,
-                              chan_master_pq_rx).unwrap())
+   	    .spawn(move || {
+            master(sock_master_ext,
+                   sock_master_db_rx,
+                   sock_master_pq_rx,
+                   chan_master_db_tx,
+                   chan_master_db_rx,
+                   chan_master_pq_tx,
+                   chan_master_pq_rx).unwrap() 
+        })
         .unwrap();
     Ok((ctx, master_thread))
 }
@@ -240,6 +290,7 @@ pub fn tx_chan<R>(packet: R, maybe_headers: Option<Headers>, chan: &Sender<Messa
     chan.send(Message { headers: maybe_headers, load: packet, }).unwrap()
 }
 
+/// Отправляем пустое сообщение в сокет
 fn notify_sock(sock: &mut zmq::Socket) -> Result<(), Error> {
     let msg = zmq::Message::new()
         .map_err(ZmqError::Message)
@@ -254,18 +305,27 @@ fn tx_chan_n<R>(packet: R, maybe_headers: Option<Headers>, chan: &Sender<Message
     notify_sock(sock)
 }
 
-
-pub fn worker_db(mut sock_tx: zmq::Socket,
-                 chan_tx: Sender<Message<DbRep>>,
-                 chan_rx: Receiver<Message<DbReq>>,
-                 mut db: db::Database) -> Result<(), Error>
+/// Функция-обработчик для работы в потоке с базой данных.
+/// Своего рода - это актор по работе с базой данных.
+fn worker_db(mut sock_tx: zmq::Socket,
+             chan_tx: Sender<Message<DbRep>>,
+             chan_rx: Receiver<Message<DbReq>>,
+             mut db: db::Database) -> Result<(), Error>
 {
+    // Отправляем пустое сообщение в сокет
     notify_sock(&mut sock_tx)?;
     loop {
+        // Прилетело какое-то сообщение в канал?
         let req = chan_rx.recv().unwrap();
+        
+        // Смотрим что за сообщение
         match req.load {
+            // Добавляем в базу что-то новое
             DbReq::Global(GlobalReq::Add { key: k, value: v, mode: m, }) => {
+                // Проверяем - есть ли что-то уже в базе данных с таким ключем?
                 if db.lookup(&k).is_some() {
+                    // Если есть, тогда 
+                    // TODO: Continue
                     tx_chan_n(DbRep::Global(GlobalRep::Kept), req.headers, &chan_tx, &mut sock_tx)?
                 } else {
                     db.insert(k.clone(), v);
@@ -695,24 +755,34 @@ fn master(mut sock_ext: zmq::Socket,
 }
 
 fn main() {
+    // Аргументы приложения
     let mut args = env::args();
+    // Пропускаем первый параметр, так как это имя самого приложения
     let cmd_proc = args.next().unwrap();
-    let mut opts = Options::new();
 
+    // Список опций приложения
+    let mut opts = Options::new();
+    // Где располагаем нашу базу данных?
     opts.optopt("d", "database", "database directory path (optional, default: ./spiderq)", "");
+    // Размер элементов в очереди перед сбросом на диск
     opts.optopt("l", "flush-limit", "database disk sync threshold (items modified before flush) (optional, default: 131072)", "");
+    // Адрес ZeroMQ очереди на которой будем сидеть
     opts.optopt("z", "zmq-addr", "zeromq interface listen address (optional, default: ipc://./spiderq.ipc)", "");
 
+    // Стартуем наше приложение
     match bootstrap(opts.parse(args)) {
-        Ok((_ctx, master_thread)) =>
-            master_thread.join().unwrap(),
+        // Все хорошо, можно прицепиться к потоку и ждать завершения
+        Ok((_, master_thread)) => {
+            master_thread.join().unwrap();
+        },
+        // Что-то пошло не так и все сфейлилось
         Err(cause) => {
             let _ = writeln!(&mut io::stderr(), "Error: {:?}", cause);
             let usage = format!("Usage: {}", cmd_proc);
             let _ = writeln!(&mut io::stderr(), "{}", opts.usage(&usage[..]));
             process::exit(1);
         }
-    };
+    }
 }
 
 #[cfg(test)]

@@ -19,9 +19,12 @@ enum ValueSlot {
 
 type Index = HashMap<Key, ValueSlot>;
 
+/// Ошибки работы с базой данных
 #[derive(Debug)]
 pub enum Error {
+    /// База данных должна размещаться в директории
     DatabaseIsNotADir(String),
+    /// Ошибка при получении информации о директории базы данных
     DatabaseStat(io::Error),
     DatabaseMkdir(io::Error),
     DatabaseTmpFile(String, io::Error),
@@ -32,7 +35,9 @@ pub enum Error {
     DatabaseUnexpectedEof,
 }
 
+/// Снепшоты базы данных
 enum Snapshot {
+    /// Снепшот в оперативной памяти, [Index] - это просто [HashMap]<[Key], [ValueSlot]>
     Memory(Index),
     Frozen(Arc<Index>),
     Persisting { index: Arc<Index>,
@@ -95,20 +100,31 @@ pub struct Database {
 }
 
 impl Database {
+    /// Создаем нашу базу данных для хранения
     pub fn new(database_dir: &str, flush_limit: usize) -> Result<Database, Error> {
+        // Сначала получаем мета-данные по директории с базой данных
         match fs::metadata(database_dir) {
+            // Если это директория - все хорошо, идем дальше
             Ok(ref metadata) if metadata.is_dir() => (),
+            // Если это не директория - выходим тогда с ошибкой
             Ok(_) => return Err(Error::DatabaseIsNotADir(database_dir.to_owned())),
-            Err(ref e) if e.kind() == io::ErrorKind::NotFound =>
-                fs::create_dir(database_dir).map_err(Error::DatabaseMkdir)?,
+            // Если в целом нет такой директории
+            Err(ref e) if e.kind() == io::ErrorKind::NotFound =>{
+                // Тогда пробуем ее создать
+                fs::create_dir(database_dir).map_err(Error::DatabaseMkdir)?;
+            },
+            // Все остальные ошибки пробрасываем выше
             Err(e) => return Err(Error::DatabaseStat(e)),
         }
 
+        // Создаем вектор со пустым снапшотом базы в оперативной памяти в виде HashMap
         let mut snapshots = vec![Snapshot::Memory(Index::new())];
+        // Пробуем подтянуть сохраненные снапшоты из базы данных, то есть ключ/значения
         if let Some(persisted_index) = load_index(database_dir)? {
             snapshots.push(Snapshot::Persisted(Arc::new(persisted_index)));
         }
 
+        // Возвращаем нашу базу
         Ok(Database {
             database_dir: Arc::new(PathBuf::from(database_dir)),
             flush_limit,
@@ -120,7 +136,10 @@ impl Database {
         self.snapshots.iter().fold(0, |total, snapshot| total + snapshot.count())
     }
 
+    /// Делаем поиск нужного элемента в базе данных.
+    /// Поиск происходит по всем снапшотам.
     pub fn lookup(&self, key: &Key) -> Option<&Value> {
+        // Идем по каждому снапшоту итеративно и ищем подходящий элемент
         for snapshot in self.snapshots.iter() {
             match snapshot.lookup(key) {
                 Some(&ValueSlot::Value(ref value)) =>
@@ -286,9 +305,14 @@ impl Database {
         }
     }
 
+    /// Создаем итератор по снепшотам базы данных.
+    /// Сам итератор исключает дубликаты ключей. 
+    /// Выдает толкьо новые ключи, которые еще не были.
     pub fn iter(&self) -> Iter {
         let mut indices = Vec::new();
+        // Идем по каждому снапшоту
         for snapshot in self.snapshots.iter() {
+            // Собираем ссылки на хешмапы индексов
             snapshot.indices_refs(&mut indices);
         }
 
@@ -306,9 +330,13 @@ impl Drop for Database {
     }
 }
 
+/// Итератор по хешмапам-индексам базы данных
 pub struct Iter<'a> {
+    // Ссылки на хеш-мапы индексов
     indices: Vec<&'a Index>,
+    // Текущий индекс в массиве индексов
     index: usize,
+    // Итератор по текущей хешмапе из массива индексов
     iter: Option<hash_map::Iter<'a, Key, ValueSlot>>,
 }
 
@@ -316,9 +344,15 @@ impl<'a> Iterator for Iter<'a> {
     type Item = (&'a Key, &'a Value);
 
     fn next(&mut self) -> Option<(&'a Key, &'a Value)> {
+        // Если еще не дошли до конца списка индексов
         while self.index < self.indices.len() {
+            // Проверяем - есть ли у нас уже итератор по хешмапе
             if let Some(ref mut map_iter) = self.iter {
+                // Если итератор есть, итерируемся по нему
                 for (key, slot) in map_iter.by_ref() {
+                    // TODO: Оптимизировать?
+                    // Делаем проверку по всем индексам в обратном порядке,
+                    // вдруг уже в предыдущих итерациях мы выдавали такой ключ
                     if self.indices[0 .. self.index]
                         .iter()
                         .rev()
@@ -327,17 +361,21 @@ impl<'a> Iterator for Iter<'a> {
                         }
 
                     match slot {
+                        // Нашли значение - все ок
                         ValueSlot::Value(ref value) =>
                             return Some((key, value)),
+                        // Удаленное значение - проходим мимо
                         ValueSlot::Tombstone =>
                             continue,
                     }
                 }
             } else {
+                // Если итератора еще нету - создаем его и идем на новую итерацию
                 self.iter = Some(self.indices[self.index].iter());
                 continue;
             }
 
+            // Обработали все в текущем индексе - идем на следующий
             self.iter = None;
             self.index += 1;
         }
@@ -351,10 +389,14 @@ fn filename_as_string(filename: &Path) -> String {
     filename.to_string_lossy().into_owned()
 }
 
+/// Из буфера для чтения вычитываем из самого начала какие-то данные
 fn read_vec<R>(source: &mut R) -> Result<Vec<u8>, Error> where R: io::Read {
+    // Вычитываем сначала размер данных
     let len = source.read_u32::<NativeEndian>().map_err(|e| Error::DatabaseRead(From::from(e)))? as usize;
+    // Создаем буфер для хранения
     let mut buffer = Vec::with_capacity(len);
     let source_ref = source.by_ref();
+    // Вычитываем конкретный размер данных из файлика после размера
     match source_ref.take(len as u64).read_to_end(&mut buffer) {
         Ok(bytes_read) if bytes_read == len => Ok(buffer),
         Ok(_) => Err(Error::DatabaseUnexpectedEof),
@@ -362,24 +404,36 @@ fn read_vec<R>(source: &mut R) -> Result<Vec<u8>, Error> where R: io::Read {
     }
 }
 
+/// Попытка подтянуть снепшоты из базы данных в виде [Index], который по сути является HashMap
 fn load_index(database_dir: &str) -> Result<Option<Index>, Error> {
+    // К пути базы данных мы добавляем еще имя файлика
     let mut db_file = PathBuf::new();
     db_file.push(database_dir);
     db_file.push("snapshot");
 
+    // Пробуем открыть наш файлик снепшотов
     match fs::File::open(&db_file) {
+        // Если файлик есть
         Ok(file) => {
+            // Создаем буферизированную обертку над ним
             let mut source = io::BufReader::new(file);
+            // Читаем из самого начала байты количества элементов
+            // TODO: Может быть заменить на конкретный размер - LittleEndian, 
+            // вдруг переноситься будет база с экзотического одного компьютера, на другой
             let total = source.read_u64::<NativeEndian>().map_err(|e| Error::DatabaseRead(From::from(e)))? as usize;
+            // Создаем хешмапу для хранения
             let mut index = Index::with_capacity(total);
+            // Вычитываем из файлика снепшота ключ и значение и собираем в наш индекс
             for _ in 0 .. total {
                 let (key, value) = (read_vec(&mut source)?, read_vec(&mut source)?);
                 index.insert(Arc::new(key), ValueSlot::Value(Arc::new(value)));
             }
             Ok(Some(index))
         },
+        // Нету файлика - все ок
         Err(ref e) if e.kind() == io::ErrorKind::NotFound =>
             Ok(None),
+        // Не смогли открыть базу - кидаем ошибку
         Err(e) =>
             Err(Error::DatabaseFileOpen(filename_as_string(&db_file), e))
     }

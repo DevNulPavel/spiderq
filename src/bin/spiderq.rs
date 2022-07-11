@@ -257,37 +257,60 @@ pub enum PqRep {
 
 /// Сообщение + заголовки с мета-информацией
 pub struct Message<R> {
+    /// Сервисные заголовки
     pub headers: Option<Headers>,
+    /// Непосредственно сами данные
     pub load: R,
 }
 
+/// Вычитываем из сокета данные и сервисные заголовки если они там есть
 fn rx_sock(sock: &mut zmq::Socket) -> Result<(Option<Headers>, Result<GlobalReq, ProtoError>), Error> {
+    // Буффер
     let mut frames = Vec::new();
     loop {
+        // Складываем получаемые сообщения в вектор
         frames.push(sock.recv_msg(0).map_err(ZmqError::Recv).map_err(Error::Zmq)?);
+        // Если больше ничего нету - прерываем цикл
         if !sock.get_rcvmore().map_err(ZmqError::GetSockOpt).map_err(Error::Zmq)? {
             break
         }
     }
 
-    let load_msg = frames.pop().unwrap();
-    Ok((Some(frames), GlobalReq::decode(&load_msg).map(|p| p.0)))
+    // TODO: Но что, если у нас дальше будут прилетать сообщения, но уже не к этому запросу
+    // Или это не важно из-за того, что у нас REQ/REP сокет?
+
+    // В самом конце у нас идет непосредственно само сообщение, которое мы декодируем
+    let load_msg = GlobalReq::decode(&frames.pop().unwrap()).map(|p| p.0);
+
+    // Все остальное мы считаем заголовками
+    Ok((Some(frames), load_msg))
 }
 
+/// Пишем ответное сообщение в сокет
 fn tx_sock(packet: GlobalRep, maybe_headers: Option<Headers>, sock: &mut zmq::Socket) -> Result<(), Error> {
+    // Размер наших данных
     let required = packet.encode_len();
+    
+    // Создаем сообщение нужного размера
     let mut load_msg = zmq::Message::with_capacity(required)
         .map_err(ZmqError::Message)
         .map_err(Error::Zmq)?;
+    
+    // Кодируем данные в нутрь сообщения
     packet.encode(&mut load_msg);
 
+    // Если есть заголовки, то пушим их сначала
     if let Some(headers) = maybe_headers {
         for header in headers {
+            // Режим zmq::SNDMORE значит, что данные будут сыпаться еще позднее и можно
+            // просто их буфферизировать
             sock.send_msg(header, zmq::SNDMORE)
                 .map_err(ZmqError::Send)
                 .map_err(Error::Zmq)?;
         }
     }
+
+    // В самом конце после всех заголовков пишем уже непосредственно наше сообщение
     sock.send_msg(load_msg, 0)
         .map_err(ZmqError::Send)
         .map_err(Error::Zmq)
@@ -472,10 +495,12 @@ fn worker_pq(mut sock_tx: zmq::Socket,
                     tx_chan_n(PqRep::Global(GlobalRep::Skipped), req.headers, &chan_tx, &mut sock_tx)?
                 }
             },
+            // TODO: ???
             PqReq::Local(PqLocalReq::NextTrigger) =>
                 tx_chan_n(PqRep::Local(PqLocalRep::TriggerGot(pq.next_timeout())), req.headers, &chan_tx, &mut sock_tx)?,
             PqReq::Local(PqLocalReq::RepayTimedOut) =>
                 pq.repay_timed_out(),
+            // Завершаем работу воркера работы с запросами
             PqReq::Local(PqLocalReq::Stop) => {
                 tx_chan_n(PqRep::Local(PqLocalRep::Stopped), req.headers, &chan_tx, &mut sock_tx)?;
                 return Ok(())
@@ -484,6 +509,7 @@ fn worker_pq(mut sock_tx: zmq::Socket,
     }
 }
 
+/// Актор по координации работы всей системы
 fn master(mut sock_ext: zmq::Socket,
           sock_db_rx: zmq::Socket,
           sock_pq_rx: zmq::Socket,
@@ -492,6 +518,7 @@ fn master(mut sock_ext: zmq::Socket,
           chan_pq_tx: Sender<Message<PqReq>>,
           chan_pq_rx: Receiver<Message<PqRep>>) -> Result<(), Error>
 {
+    // Состояние ожидания завершения работы приложения
     enum StopState {
         NotTriggered,
         WaitingPqAndDb(Option<Headers>),
@@ -515,13 +542,15 @@ fn master(mut sock_ext: zmq::Socket,
     let mut next_timeout: Option<Option<SteadyTime>> = None;
     let mut stop_state = StopState::NotTriggered;
 
-    // sync with workers
+    // Дожидаемся старта каждого из воркеров с помощью 
+    // получения сообщений оттуда с помощью сокета
     let _ = sock_db_rx.recv_msg(0).map_err(ZmqError::Recv).map_err(Error::Zmq)?;
     let _ = sock_pq_rx.recv_msg(0).map_err(ZmqError::Recv).map_err(Error::Zmq)?;
 
     loop {
-        // check if it is time to quit
+        // Если мы в состоянии полного завершения работы - можем успешно выйти из цикла
         if let StopState::Finished(headers) = stop_state {
+            // Отправив при этом во внешний сокет сообщение про успешное завершение работы
             tx_sock(GlobalRep::Terminated, headers, &mut sock_ext)?;
             return Ok(())
         }
@@ -529,14 +558,17 @@ fn master(mut sock_ext: zmq::Socket,
         let mut pq_changed = false;
         let before_poll_ts = SteadyTime::now();
 
-        // calculate poll delay
+        // TODO: Считаем задержку перед очередной итерацией?
         let timeout = match next_timeout {
             None => {
+                // TODO: ???
+                // Пишем сообщение в канал работы с очередью для инициализации?
                 tx_chan(PqReq::Local(PqLocalReq::NextTrigger), None, &chan_pq_tx);
                 MAX_POLL_TIMEOUT
             },
-            Some(None) =>
-                MAX_POLL_TIMEOUT,
+            Some(None) => {
+                MAX_POLL_TIMEOUT
+            },
             Some(Some(next_trigger)) => {
                 let interval = next_trigger - before_poll_ts;
                 match interval.num_milliseconds() {
@@ -555,35 +587,47 @@ fn master(mut sock_ext: zmq::Socket,
             },
         };
 
+        // Создаем массив с информацией о данных в сокетах
+        // TODO: Для наглядности лучше бы структурку сделать вместо массива
         let avail_socks = {
+            // Список ZeroMQ сокетов, где нужно ждать события о доступности данных на чтение
+            // .as_poll_item нужен для того, чтобы вытягивать новые события только какого-то одного типа.
             let mut pollitems = [sock_ext.as_poll_item(zmq::POLLIN),
                                  sock_db_rx.as_poll_item(zmq::POLLIN),
                                  sock_pq_rx.as_poll_item(zmq::POLLIN)];
+            // Опрашиваем массив полл-сокетов с определенным таймаутом
             zmq::poll(&mut pollitems, timeout)
                 .map_err(ZmqError::Poll)
                 .map_err(Error::Zmq)?;
+            // Выдаем массив наличия событий в каждом типе событий
             [pollitems[0].get_revents() == zmq::POLLIN,
              pollitems[1].get_revents() == zmq::POLLIN,
              pollitems[2].get_revents() == zmq::POLLIN]
         };
 
         let after_poll_ts = SteadyTime::now();
+
+        // Есть что-то в сокете внешнем?
         if avail_socks[0] {
-            // sock_ext is online
+            // Получаем из внешнего сокета данные раз они там готовы
             match rx_sock(&mut sock_ext) {
+                // Складываем в очередь полученных данных заголовки и сам запрос
                 Ok((headers, Ok(req))) => incoming_queue.push((headers, req)),
+                // Если не смогли получить, тогда выдаем в ответ на тот же сокет ошибку
                 Ok((headers, Err(e))) => tx_sock(GlobalRep::Error(e), headers, &mut sock_ext)?,
                 Err(e) => return Err(e),
             }
         }
 
+        // Что-то есть в сокете работы с базой данных?
         if avail_socks[1] {
-            // sock_db is online, skip ping msg
+            // Обычно это просто сообщение пинга, чтоб оживить мастера и проверить работоспособночть
             let _ = sock_db_rx.recv_msg(0).map_err(ZmqError::Recv).map_err(Error::Zmq)?;
         }
 
+        // Что-то есть в сокете работы с очередью
         if avail_socks[2] {
-            // sock_pq is online, skip ping msg
+            // Обычно это просто сообщение пинга, чтоб оживить мастера и проверить работоспособночть
             let _ = sock_pq_rx.recv_msg(0).map_err(ZmqError::Recv).map_err(Error::Zmq)?;
         }
 

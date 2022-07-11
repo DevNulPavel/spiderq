@@ -148,7 +148,7 @@ pub fn entrypoint(zmq_addr: &str, database_dir: &str, flush_limit: usize) -> Res
 
     // Роутеру назначаем переданный адрес
     sock_master_ext.bind(zmq_addr).map_err(ZmqError::Bind).map_err(Error::Zmq)?;
-    // Всем остальным назначаем сокеты межпроцессного взаимодействия
+    // Всем остальным назначаем сокеты ВНУТРИпроцессного взаимодействия, работает вроде бы только на UNIX?
     sock_master_db_rx.bind("inproc://db_rxtx").map_err(ZmqError::Bind).map_err(Error::Zmq)?;
     sock_db_master_tx.connect("inproc://db_rxtx").map_err(ZmqError::Connect).map_err(Error::Zmq)?;
     sock_master_pq_rx.bind("inproc://pq_rxtx").map_err(ZmqError::Bind).map_err(Error::Zmq)?;
@@ -286,6 +286,7 @@ fn tx_sock(packet: GlobalRep, maybe_headers: Option<Headers>, sock: &mut zmq::So
         .map_err(Error::Zmq)
 }
 
+/// Отправление сообщения в канал
 pub fn tx_chan<R>(packet: R, maybe_headers: Option<Headers>, chan: &Sender<Message<R>>) {
     chan.send(Message { headers: maybe_headers, load: packet, }).unwrap()
 }
@@ -300,6 +301,7 @@ fn notify_sock(sock: &mut zmq::Socket) -> Result<(), Error> {
         .map_err(Error::Zmq)
 }
 
+/// Отправляем определенный пакет с заголовками в канал + оповещаем сокет путым пакетом
 fn tx_chan_n<R>(packet: R, maybe_headers: Option<Headers>, chan: &Sender<Message<R>>, sock: &mut zmq::Socket) -> Result<(), Error> {
     tx_chan(packet, maybe_headers, chan);
     notify_sock(sock)
@@ -324,38 +326,52 @@ fn worker_db(mut sock_tx: zmq::Socket,
             DbReq::Global(GlobalReq::Add { key: k, value: v, mode: m, }) => {
                 // Проверяем - есть ли что-то уже в базе данных с таким ключем?
                 if db.lookup(&k).is_some() {
-                    // Если есть, тогда 
-                    // TODO: Continue
+                    // Если есть, тогда пишем в ответный канал сообщение + оповещаем сокет о событии
                     tx_chan_n(DbRep::Global(GlobalRep::Kept), req.headers, &chan_tx, &mut sock_tx)?
                 } else {
+                    // Если не было, тогда пишем в базу 
                     db.insert(k.clone(), v);
+                    // Отправляем в ответ сообщение про успешную запись в базу
                     tx_chan_n(DbRep::Local(DbLocalRep::Added(k, m)), req.headers, &chan_tx, &mut sock_tx)?
                 }
             },
+            // Обновляем значение в базе
             DbReq::Global(GlobalReq::Update(key, value)) => {
+                // Ищем значение в базе данных
                 if db.lookup(&key).is_some() {
+                    // Если нашли, то просто добавляем новое под тем же ключем
                     db.insert(key.clone(), value);
+                    // Пишем сообщение об обновлении в канал + дергаем сокет пустым сообщением
                     tx_chan_n(DbRep::Global(GlobalRep::Updated), req.headers, &chan_tx, &mut sock_tx)?
                 } else {
+                    // Такого поля нет - пишем в канал + сокет пустым сообещнием
                     tx_chan_n(DbRep::Global(GlobalRep::NotFound), req.headers, &chan_tx, &mut sock_tx)?
                 }
             },
+            // Ищем значение по ключу в базе
             DbReq::Global(GlobalReq::Lookup(key)) => {
                 if let Some(value) = db.lookup(&key) {
+                    // Нашли - отправляем значение в ответ + оповещаем сокет
                     tx_chan_n(DbRep::Global(GlobalRep::ValueFound(value.clone())), req.headers, &chan_tx, &mut sock_tx)?
                 } else {
+                    // Не нашли
                     tx_chan_n(DbRep::Global(GlobalRep::ValueNotFound), req.headers, &chan_tx, &mut sock_tx)?
                 }
             },
+            // Удаление значения из базы
             DbReq::Global(GlobalReq::Remove(key)) => {
                 if db.lookup(&key).is_some() {
+                    // Удаляем и оповещаем
                     db.remove(key.clone());
                     tx_chan_n(DbRep::Local(DbLocalRep::Removed(key)), req.headers, &chan_tx, &mut sock_tx)?
                 } else {
+                    // Оповещяем, что не нашли
                     tx_chan_n(DbRep::Global(GlobalRep::NotRemoved), req.headers, &chan_tx, &mut sock_tx)?
                 }
             },
+            // Прилетала команда на сброс данных
             DbReq::Global(GlobalReq::Flush) => {
+                // Запрашиваем сброс на диск
                 db.flush();
                 tx_chan_n(DbRep::Global(GlobalRep::Flushed), req.headers, &chan_tx, &mut sock_tx)?
             },

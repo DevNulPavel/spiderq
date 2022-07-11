@@ -11,9 +11,12 @@ use tempdir::TempDir;
 use byteorder::{ReadBytesExt, WriteBytesExt, NativeEndian};
 use super::proto::{Key, Value};
 
+/// Тип значения в базе
 #[derive(Clone)]
 enum ValueSlot {
+    /// Все нормально, значение хорошее
     Value(Value),
+    /// Удаленное значение из базы
     Tombstone,
 }
 
@@ -35,18 +38,34 @@ pub enum Error {
     DatabaseUnexpectedEof,
 }
 
-/// Снепшоты базы данных
+/// Снапшоты базы данных
 enum Snapshot {
-    /// Снепшот в оперативной памяти, [Index] - это просто [HashMap]<[Key], [ValueSlot]>
+    /// Снапшот в оперативной памяти, [Index] - это просто [HashMap]<[Key], [ValueSlot]>
     Memory(Index),
+    /// Снапшот все еще в оперативной памяти, но зафиксирован от изменения и готов к скидыванию на диск
     Frozen(Arc<Index>),
-    Persisting { index: Arc<Index>,
-                 chan: Receiver<Result<(), Error>>,
-                 slave: JoinHandle<()>, },
+    /// Снапшот сохраняется на диск, 
+    /// но дополнительно продублирован в оперативной памяти
+    Persisting { 
+        /// Наш снапшот в оперативной памяти
+        index: Arc<Index>,
+        /// Канал для получения подтверждения, что снапшот уже скинут на диск успешно
+        chan: Receiver<Result<(), Error>>,
+        /// Join хендл для проверки, что поток отработал
+        slave: JoinHandle<()>, 
+    },
+    /// Все было успешно сохранено на диск + продублировано в оперативке
     Persisted(Arc<Index>),
-    Merging { indices: Arc<Vec<Arc<Index>>>,
-              chan: Receiver<Index>,
-              slave: JoinHandle<()>, },
+    /// У нас был запущен процесс слияня данныъ
+    Merging { 
+        /// Данные, которые сейчас сливаются вместе.
+        /// Поле нужно для того, чтобы мы продолжали работать еще еще.
+        indices: Arc<Vec<Arc<Index>>>,
+        /// Канал для ожидания смерженной общей хешмапы
+        chan: Receiver<Index>,
+        /// Join для поддержки ожидания завершения
+        slave: JoinHandle<()>, 
+    },
 }
 
 impl Snapshot {
@@ -172,33 +191,48 @@ impl Database {
         self.update_snapshots(false);
     }
 
+    /// Занимается тем, что скидывает данные по базе данных на диск
     pub fn flush(&mut self) {
         self.update_snapshots(true);
     }
 
+    /// Формируем снапшоты
     fn update_snapshots(&mut self, flush_mode: bool) {
         loop {
-            // Check if memory part overflowed
+            // Первый снепшот у нас всегда является Memory типом обычно.
+            // Поэтому проверяем - не было ли заполнено?
             if let Some(index_to_freeze) = match self.snapshots.first_mut() {
-                Some(&mut Snapshot::Memory(ref mut idx)) if (idx.len() >= self.flush_limit) || (!idx.is_empty() && flush_mode) =>
-                    Some(mem::take(idx)),
-                _ =>
-                    None,
+                // Делаем проверку, достигли мы лимита по записям в индексе оперативной памяти или нет?
+                // Либо у нас форсированое скидывание данных на диск?
+                Some(&mut Snapshot::Memory(ref mut idx)) if (idx.len() >= self.flush_limit) || (!idx.is_empty() && flush_mode) =>{
+                    // Извлекаем все значения из базы в оперативной памяти, заменяя на пустой словарь
+                    Some(mem::take(idx))
+                },
+                _ => None,
             } {
+                // Если мы извлекли данные из оперативной памяти, тогда нам нужно зафиксировать данные в типе Frozen
+                // Поэтому кладем на второе место в списке наш снапшот
                 self.snapshots.insert(1, Snapshot::Frozen(Arc::new(index_to_freeze)));
                 continue;
             }
 
-            // Check if last snapshot is not persisted
+            // Если последний снапшот в списке у нас типа Frozen.
+            // Например, тот, что положили до этого
             if let Some(last_snapshot) = self.snapshots.last_mut() {
                 if let Some(index_to_persist) = match last_snapshot {
                     &mut Snapshot::Frozen(ref idx) => Some(idx.clone()),
                     _ => None,
                 } {
+                    // Создаем небуфферизированный синхронный канал
                     let (tx, rx) = sync_channel(0);
+                    // Директория, в которой хранится база
                     let slave_dir = self.database_dir.clone();
+                    // Создаем клон Arc этого нашего Frozen снапшота
                     let slave_index = index_to_persist.clone();
+                    // Создаем новый поток в котором сохраняем на диск снепшот + заменяем файлик снепшотов
                     let slave = spawn(move || tx.send(persist(slave_dir, slave_index)).unwrap());
+
+                    // Теперь этот последний снапшот у нас типа "сохраняется на диск"
                     *last_snapshot = Snapshot::Persisting {
                         index: index_to_persist,
                         chan: rx,
@@ -208,8 +242,9 @@ impl Database {
                 }
             }
 
-            // Check if several snapshots should be merged
+            // Делаем проверку, вдруг нам нужно вмержишь некоторые снапшоты
             enum MergeLayout { FirstMemory, AtLeastOneFrozen, MaybeMoreFrozen, LastPersisted, }
+            // Сначала определяем, что нам вообще надо делать обходя массив снапшотов
             let merge_decision =
                 self.snapshots.iter().fold(Some(MergeLayout::FirstMemory), |state, snapshot| match (state, snapshot) {
                     (Some(MergeLayout::FirstMemory), &Snapshot::Memory(..)) => Some(MergeLayout::AtLeastOneFrozen),
@@ -218,7 +253,10 @@ impl Database {
                     (Some(MergeLayout::MaybeMoreFrozen), &Snapshot::Persisted(..)) => Some(MergeLayout::LastPersisted),
                     _ => None,
                 });
+            // Если у нас последний снапшот сохраненный на диск
             if let Some(MergeLayout::LastPersisted) = merge_decision {
+                // Из снапшотов тянем все, кроме самого первого - выбирая лишь те, 
+                // которые заморожены + сохранены на диск
                 let indices: Vec<_> = self.snapshots.drain(1 ..)
                     .map(|snapshot| match snapshot {
                         Snapshot::Frozen(idx) => idx,
@@ -226,10 +264,14 @@ impl Database {
                         _ => unreachable!(),
                     })
                     .collect();
+                // Для продолжения работоспособности сохраняем несмерженные данные
                 let master_indices = Arc::new(indices);
+                // Создаем копию Arc для мержа
                 let slave_indices = master_indices.clone();
                 let (tx, rx) = sync_channel(0);
+                // Запускаем в работу процесс слияния
                 let slave = spawn(move || tx.send(merge(slave_indices)).unwrap());
+                // В снапшоты сохряняем состояние мержа для отслеживания состояния
                 self.snapshots.push(Snapshot::Merging {
                     indices: master_indices,
                     chan: rx,
@@ -384,7 +426,7 @@ impl<'a> Iterator for Iter<'a> {
     }
 }
 
-
+/// Просто конвертация пути в строку
 fn filename_as_string(filename: &Path) -> String {
     filename.to_string_lossy().into_owned()
 }
@@ -439,14 +481,20 @@ fn load_index(database_dir: &str) -> Result<Option<Index>, Error> {
     }
 }
 
+/// Пишем в писателя какое-то значение
 fn write_vec<W>(value: &Arc<Vec<u8>>, target: &mut W) -> Result<(), Error> where W: io::Write {
+    // Сначала длину данных
     target.write_u32::<NativeEndian>(value.len() as u32).map_err(|e| Error::DatabaseWrite(From::from(e)))?;
+    // Затем сами данные
     target.write_all(&value[..]).map_err(Error::DatabaseWrite)?;
     Ok(())
 }
 
+/// Выполнение сохранения на диск базы данных из оперативной памяти
 fn persist(dir: Arc<PathBuf>, index: Arc<Index>) -> Result<(), Error> {
+    // Имя файлика будет снапшот
     let db_filename = "snapshot";
+    // Создаем во временной директории `/tmp` файлик с путем базы данных
     let tmp_dir = TempDir::new_in(&*dir, "snapshot").map_err(Error::DatabaseMkdir)?;
     let mut tmp_db_file = PathBuf::new();
     tmp_db_file.push(tmp_dir.path());
@@ -456,10 +504,14 @@ fn persist(dir: Arc<PathBuf>, index: Arc<Index>) -> Result<(), Error> {
     let mut actual_len = 0;
 
     {
+        // Открываем файлик на запись во временной директории
         let mut file = io::BufWriter::new(
             fs::File::create(&tmp_db_file).map_err(|e| Error::DatabaseTmpFile(filename_as_string(&tmp_db_file), e))?);
+        // Пишем в начало длину элементов
         file.write_u64::<NativeEndian>(approx_len as u64).map_err(|e| Error::DatabaseWrite(From::from(e)))?;
+        // Затем пишем в файлик key/value поочередно
         for (key, slot) in &*index {
+            // Но дополнительно сверяем, что это нормальное значение, а не удаленное
             if let &ValueSlot::Value(ref value) = slot {
                 write_vec(key, &mut file)?;
                 write_vec(value, &mut file)?;
@@ -468,6 +520,9 @@ fn persist(dir: Arc<PathBuf>, index: Arc<Index>) -> Result<(), Error> {
         }
     }
 
+    // Если мы записали не все данные в файлик, 
+    // тогда нам надо файлик заново открыть и подправить в самом 
+    // начале файлика размер на актуальный
     if actual_len != approx_len {
         let mut file = fs::OpenOptions::new()
             .read(true)
@@ -477,10 +532,13 @@ fn persist(dir: Arc<PathBuf>, index: Arc<Index>) -> Result<(), Error> {
         file.write_u64::<NativeEndian>(actual_len as u64).map_err(|e| Error::DatabaseWrite(From::from(e)))?;
     }
 
+    // Уже нормальный путь для файлика куда нам надо положить его
     let mut db_file = PathBuf::new();
     db_file.push(&*dir);
     db_file.push(db_filename);
 
+    // Затем файлик перемещаем в нужное место
+    // Таким образом у нас достигается некая транзакционность
     fs::rename(&tmp_db_file, &db_file).map_err(|e| Error::DatabaseMove(filename_as_string(&tmp_db_file), filename_as_string(&db_file), e))
 }
 

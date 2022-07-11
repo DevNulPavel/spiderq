@@ -281,11 +281,14 @@ impl Database {
                 continue;
             }
 
-            // Check if persisting is finished
+            // Находим те снапшоты, у которых состояние "сохранение на диск"
             if let Some(persisting_snapshot) = self.snapshots.iter_mut().find(|snapshot| matches!(snapshot, Snapshot::Persisting{..}) ) {
+                // Получаем статус завершения из канала
                 let done_index =
                     if let &mut Snapshot::Persisting { index: ref idx, chan: ref rx, .. } = persisting_snapshot {
+                        // Если у нас не форсированный режим сброса
                         if !flush_mode {
+                            // Тогда просто пробуем получить данные из канала без ожидания
                             match rx.try_recv() {
                                 Ok(Ok(())) => Some(idx.clone()),
                                 Ok(Err(e)) => panic!("persisting thread failed: {:?}", e),
@@ -293,6 +296,7 @@ impl Database {
                                 Err(TryRecvError::Disconnected) => panic!("persisting thread is down"),
                             }
                         } else {
+                            // Если у нас форсированный, тогда принудительно ждем из канала новые данные
                             match rx.recv().unwrap() {
                                 Ok(()) => Some(idx.clone()),
                                 Err(e) => panic!("persisting thread failed: {:?}", e),
@@ -302,22 +306,26 @@ impl Database {
                         unreachable!()
                     };
 
+                // Если есть что-то, что завершилось успешно
                 if let Some(persisted_index) = done_index {
-                    if let Snapshot::Persisting { slave: thread, .. } =
-                        mem::replace(persisting_snapshot, Snapshot::Persisted(persisted_index)) {
-                            thread.join().unwrap();
-                        } else {
-                            unreachable!()
-                        }
+                    // Тогда заменяем на тип Persisted + дожидаемся завершения работы потока
+                    if let Snapshot::Persisting { slave: thread, .. } 
+                        = mem::replace(persisting_snapshot, Snapshot::Persisted(persisted_index)) 
+                    {
+                        thread.join().unwrap();
+                    } else {
+                        unreachable!()
+                    }
 
                     continue;
                 }
             }
 
-            // Check if merging is finished
+            // Находим снапшоты, которые завершились после мержа
             if let Some(merging_snapshot) = self.snapshots.iter_mut().find(|snapshot| matches!(snapshot, Snapshot::Merging{..})) {
-                let done_index =
-                    if let &mut Snapshot::Merging { chan: ref rx, .. } = merging_snapshot {
+                // Получаем завершенный снапшот после мержа если есть
+                let done_index = if let &mut Snapshot::Merging { chan: ref rx, .. } = merging_snapshot {
+                        // Если у нас обычный режим, то просто пробуем получить с помощью .try_recv данные
                         if !flush_mode {
                             match rx.try_recv() {
                                 Ok(merged_index) => Some(merged_index),
@@ -325,19 +333,24 @@ impl Database {
                                 Err(TryRecvError::Disconnected) => panic!("merging thread is down"),
                             }
                         } else {
+                            // Если же у нас форсированный режим, значит нужно уже получать блокирующим образом
                             Some(rx.recv().unwrap())
                         }
                     } else {
                         unreachable!()
                     };
-
+                
+                // Если есть завершенный снапшот
                 if let Some(merged_index) = done_index {
-                    if let Snapshot::Merging { slave: thread, .. } =
-                        mem::replace(merging_snapshot, Snapshot::Frozen(Arc::new(merged_index))) {
-                            thread.join().unwrap();
-                        } else {
-                            unreachable!()
-                        }
+                    // Тогда заменяем на тип Frozen
+                    if let Snapshot::Merging { slave: thread, .. } 
+                        = mem::replace(merging_snapshot, Snapshot::Frozen(Arc::new(merged_index))) 
+                    {
+                        // И ждем завершения потока
+                        thread.join().unwrap();
+                    } else {
+                        unreachable!()
+                    }
 
                     continue;
                 }
@@ -542,6 +555,7 @@ fn persist(dir: Arc<PathBuf>, index: Arc<Index>) -> Result<(), Error> {
     fs::rename(&tmp_db_file, &db_file).map_err(|e| Error::DatabaseMove(filename_as_string(&tmp_db_file), filename_as_string(&db_file), e))
 }
 
+/// Выполнение слияния массивов индексов в один общий
 fn merge(indices: Arc<Vec<Arc<Index>>>) -> Index {
     let mut base_index: Option<Index> = None;
     for index in indices.iter().rev() {

@@ -225,9 +225,12 @@ pub enum PqLocalRep {
 
 pub type Headers = Vec<zmq::Message>;
 
+/// Тип запроса
 #[derive(Debug, PartialEq)]
 pub enum DbReq {
+    /// Глобальный
     Global(GlobalReq),
+    /// Локальный от самого сервиса
     Local(DbLocalReq),
 }
 
@@ -249,6 +252,7 @@ pub enum PqRep {
     Local(PqLocalRep),
 }
 
+/// Сообщение + заголовки с мета-информацией
 pub struct Message<R> {
     pub headers: Option<Headers>,
     pub load: R,
@@ -371,23 +375,33 @@ fn worker_db(mut sock_tx: zmq::Socket,
             },
             // Прилетала команда на сброс данных
             DbReq::Global(GlobalReq::Flush) => {
-                // Запрашиваем сброс на диск
+                // Запрашиваем сброс на диск и обновление структуры снапшотов
                 db.flush();
+                // Оповещаем, что данные были успешно сброшены на диск
                 tx_chan_n(DbRep::Global(GlobalRep::Flushed), req.headers, &chan_tx, &mut sock_tx)?
             },
-            DbReq::Global(..) =>
+            // Все остальные события не должны прилетать снаружи
+            // TODO: Может быть не нужно паниковать и падать, а просто написать ошибку в логи?
+            DbReq::Global(..) => 
                 unreachable!(),
-            DbReq::Local(DbLocalReq::LoadLent(lend_key, key, timeout, trigger_at, mode)) =>
+            // Локальное какое-то событие, которое прилетело нам
+            DbReq::Local(DbLocalReq::LoadLent(lend_key, key, timeout, trigger_at, mode)) => {
+                // Ищем определенное значение
                 if let Some(value) = db.lookup(&key) {
+                    // Отправляем уже глобальное событие 
                     tx_chan_n(DbRep::Global(GlobalRep::Lent { lend_key, key, value: value.clone(), }),
                               req.headers, &chan_tx, &mut sock_tx)?
                 } else {
+                    // Такого ключа нету
                     tx_chan_n(DbRep::Local(DbLocalRep::LentNotFound(key, timeout, trigger_at, mode)), req.headers, &chan_tx, &mut sock_tx)?
-                },
+                }
+            },
+            // TODO: Обновление значения по ключу?
             DbReq::Local(DbLocalReq::RepayUpdate(key, value)) => {
                 db.insert(key, value);
                 tx_chan_n(DbRep::Global(GlobalRep::Repaid), req.headers, &chan_tx, &mut sock_tx)?
             },
+            // Останавливаем работу текущего актора по работе с базой данных
             DbReq::Local(DbLocalReq::Stop) => {
                 tx_chan_n(DbRep::Local(DbLocalRep::Stopped), req.headers, &chan_tx, &mut sock_tx)?;
                 return Ok(())

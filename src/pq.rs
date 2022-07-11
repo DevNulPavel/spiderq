@@ -52,7 +52,8 @@ impl PartialOrd for LentEntry {
 pub struct PQueue {
     /// Номер следующего добавляемого элемента
     serial: u64,
-    /// Сами элементы храним в куче
+    /// Сами элементы храним в двоичной куче. 
+    /// Там элементы у нас будут отсортированы от меньшего к большему.
     queue: BinaryHeap<PQueueEntry>,
     lentm: HashMap<Key, LendSnapshot>,
     lentq: BinaryHeap<LentEntry>,
@@ -95,13 +96,20 @@ impl PQueue {
         });
     }
 
+    /// Получаеем элемент с наибольшим приоритетом в очереди
     pub fn top(&self) -> Option<(Key, u64)> {
         self.queue.peek().map(|e| (e.key.clone(), self.serial))
     }
 
+    // TODO: ???
+    /// "Одалживаем" запись в топе очереди, возвращая ее номер
     pub fn lend(&mut self, trigger_at: SteadyTime) -> Option<u64> {
+        // Извлекаем значение из кучи с наибольшим приоритетом
         if let Some(entry) = self.queue.pop() {
+            // TODO: ???
+            // Создаем в куче "одалживаний" новый элемент с найденным ключем и текущим номером
             self.lentq.push(LentEntry { trigger_at, key: entry.key.clone(), snapshot: self.serial, });
+            // Теперь сохраняем в хеш-мапе одалживаний значение
             self.lentm.insert(entry.key.clone(), LendSnapshot { serial: self.serial, recycle: None, entry, });
             Some(self.serial)
         } else {
@@ -109,6 +117,7 @@ impl PQueue {
         }
     }
 
+    /// Получаем время очередного таймаута в очереди
     pub fn next_timeout(&mut self) -> Option<SteadyTime> {
         while let Some(&LentEntry { trigger_at: trigger, key: ref k, snapshot: qshot, .. }) = self.lentq.peek() { 
             let do_recycle = match self.lentm.get_mut(k) {
@@ -136,11 +145,15 @@ impl PQueue {
         }
     }
 
+    /// TODO: ???
     pub fn repay(&mut self, lend_key: u64, key: Key, status: RepayStatus) -> bool {
+        // Получаем значение в очереди по ключу
         if let Entry::Occupied(map_entry) = self.lentm.entry(key) {
+            // Проверяем номер в очереди, если не совпадает, то выходим
             if lend_key != map_entry.get().serial {
                 return false
             }
+            // 
             let LendSnapshot { mut entry, .. } = map_entry.remove();
             let min_priority = if let Some(&PQueueEntry { priority: p, .. }) = self.queue.peek() { p } else { 0 };
             let region = self.serial + 1 - min_priority;
@@ -164,9 +177,13 @@ impl PQueue {
         }
     }
 
+    /// Делаем продление аренды для ключа и ключа аренды
     pub fn heartbeat(&mut self, lend_key: u64, key: &Key, trigger_at: SteadyTime) -> bool {
+        // Ищем в хешмапе аренды ключ
         if let Some(snapshot) = self.lentm.get_mut(key) {
+            // Значение должно совпадать
             if lend_key == snapshot.serial {
+                // Обновляем длительность аренды
                 snapshot.recycle = Some(trigger_at);
                 true
             } else {
@@ -177,6 +194,7 @@ impl PQueue {
         }
     }
 
+    /// Удаление элемента из очереди посредством очистки из хешмапы аренды
     pub fn remove(&mut self, key: Key) {
         self.lentm.remove(&key);
     }

@@ -22,6 +22,7 @@ enum ValueSlot {
 
 type Index = HashMap<Key, ValueSlot>;
 
+// TODO: Добавить реализацию Error
 /// Ошибки работы с базой данных
 #[derive(Debug)]
 pub enum Error {
@@ -29,12 +30,19 @@ pub enum Error {
     DatabaseIsNotADir(String),
     /// Ошибка при получении информации о директории базы данных
     DatabaseStat(io::Error),
+    /// Не смогли создать директорю для базы данных
     DatabaseMkdir(io::Error),
+    /// Проблемы с созданием временного файлика для снапшота
     DatabaseTmpFile(String, io::Error),
+    /// Проблема с открытием файлика базы
     DatabaseFileOpen(String, io::Error),
+    /// не смогли записать в файлик снапшот базы
     DatabaseWrite(io::Error),
+    /// Проблемы с перемещением файлика из tmp в нормальное место
     DatabaseMove(String, String, io::Error),
+    /// Проблемы при чтении
     DatabaseRead(io::Error),
+    /// Что-то неизвестное
     DatabaseUnexpectedEof,
 }
 
@@ -97,6 +105,7 @@ impl Snapshot {
         }
     }
 
+    /// Собираем в общее хранилище ссылку на текущую хешмапу
     fn indices_refs<'a, 'b>(&'a self, refs: &'b mut Vec<&'a Index>) {
         match self {
             Snapshot::Memory(ref idx) => refs.push(&*idx),
@@ -173,14 +182,17 @@ impl Database {
         None
     }
 
+    /// Добавляем новй элемент к списку
     pub fn insert(&mut self, key: Key, value: Value) {
         self.insert_slot(key, ValueSlot::Value(value))
     }
 
+    /// Удаляем элемент по ключу путем проставления для записи пустого значения
     pub fn remove(&mut self, key: Key) {
         self.insert_slot(key, ValueSlot::Tombstone)
     }
 
+    /// Пишем в самый первый in-memory снапшот наши данные по ключу
     fn insert_slot(&mut self, key: Key, slot: ValueSlot) {
         if let Some(&mut Snapshot::Memory(ref mut idx)) = self.snapshots.first_mut() {
             idx.insert(key, slot);
@@ -188,6 +200,7 @@ impl Database {
             panic!("unexpected snapshots layout");
         }
 
+        // Обязательно вызываем попытку обновления списка снепшотов
         self.update_snapshots(false);
     }
 
@@ -381,6 +394,7 @@ impl Database {
 
 impl Drop for Database {
     fn drop(&mut self) {
+        // При уничтожении базы данных делаем принудительный сброс на диск
         self.flush();
     }
 }

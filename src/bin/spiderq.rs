@@ -195,13 +195,16 @@ pub enum DbLocalReq {
     Stop,
 }
 
+/// Запросы к очереди
 #[derive(Debug, PartialEq)]
 pub enum PqLocalReq {
     NextTrigger,
+    /// Ставим в очередь новый элемент
     Enqueue(Key, AddMode),
     LendUntil(u64, SteadyTime, LendMode),
     RepayTimedOut,
     Heartbeat(u64, Key, SteadyTime),
+    /// Удаление элемента из очереди
     Remove(Key),
     Stop,
 }
@@ -410,17 +413,25 @@ fn worker_db(mut sock_tx: zmq::Socket,
     }
 }
 
-pub fn worker_pq(mut sock_tx: zmq::Socket,
-                 chan_tx: Sender<Message<PqRep>>,
-                 chan_rx: Receiver<Message<PqReq>>,
-                 mut pq: pq::PQueue) -> Result<(), Error>
+/// Актор по работе с очередью приоритетов
+fn worker_pq(mut sock_tx: zmq::Socket,
+             chan_tx: Sender<Message<PqRep>>,
+             chan_rx: Receiver<Message<PqReq>>,
+             mut pq: pq::PQueue) -> Result<(), Error>
 {
+    // Оповещаем сокет о получении?
     notify_sock(&mut sock_tx)?;
     loop {
+        // Получаем команду по работе с очередью для актора
         let req = chan_rx.recv().unwrap();
         match req.load {
-            PqReq::Global(GlobalReq::Count) =>
-                tx_chan_n(PqRep::Global(GlobalRep::Counted(pq.len())), req.headers, &chan_tx, &mut sock_tx)?,
+            // Получаем внешний запрос с информацией о количестве элементов в очереди
+            PqReq::Global(GlobalReq::Count) => {
+                // Кидаем в ответ сообщение с количеством элементов в очереди
+                tx_chan_n(PqRep::Global(GlobalRep::Counted(pq.len())), req.headers, &chan_tx, &mut sock_tx)?;
+            },
+            // TODO: ???
+            // Пишем в очередь значение, которое одолжили до этого с получением номера в очереди
             PqReq::Global(GlobalReq::Repay { lend_key: rlend_key, key: rkey, value: rvalue, status: rstatus, }) =>
                 if pq.repay(rlend_key, rkey.clone(), rstatus) {
                     tx_chan_n(PqRep::Local(PqLocalRep::Repaid(rkey, rvalue)), req.headers, &chan_tx, &mut sock_tx)?
@@ -429,22 +440,31 @@ pub fn worker_pq(mut sock_tx: zmq::Socket,
                 },
             PqReq::Global(..) =>
                 unreachable!(),
+            // Добавляем в очередь новый элемент
             PqReq::Local(PqLocalReq::Enqueue(key, mode)) =>
                 pq.add(key, mode),
+            // Удаляем элемент из очереди
             PqReq::Local(PqLocalReq::Remove(key)) =>
                 pq.remove(key),
-            PqReq::Local(PqLocalReq::LendUntil(timeout, trigger_at, mode)) =>
+            // Арендуем место в очереди на определенное время
+            PqReq::Local(PqLocalReq::LendUntil(timeout, trigger_at, mode)) => {
+                // Получаем текущее значение на верхушке очереди
                 if let Some((key, serial)) = pq.top() {
+                    // Отправляем статус, что мы арендовали значение
                     tx_chan_n(PqRep::Local(PqLocalRep::Lent(serial, key, timeout, trigger_at, mode)), req.headers, &chan_tx, &mut sock_tx)?;
+                    // Извлекаем значение, которое получили при вызове pop
                     pq.lend(trigger_at);
                 } else {
+                    // Если у нас в очереди нет никакого значения, догда выдаем сообщение в ответ
                     match mode {
                         LendMode::Block =>
                             tx_chan_n(PqRep::Local(PqLocalRep::EmptyQueueHit { timeout }), req.headers, &chan_tx, &mut sock_tx)?,
                         LendMode::Poll =>
                             tx_chan_n(PqRep::Global(GlobalRep::QueueEmpty), req.headers, &chan_tx, &mut sock_tx)?,
                     }
-                },
+                }
+            },
+            // Обновление времени аренды
             PqReq::Local(PqLocalReq::Heartbeat(lend_key, ref key, trigger_at)) => {
                 if pq.heartbeat(lend_key, key, trigger_at) {
                     tx_chan_n(PqRep::Global(GlobalRep::Heartbeaten), req.headers, &chan_tx, &mut sock_tx)?

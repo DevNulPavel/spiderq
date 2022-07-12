@@ -1165,7 +1165,7 @@ mod test {
         tx_sock(GlobalReq::Count, sock); 
         assert_eq!(rx_sock(sock), GlobalRep::Counted(0));
 
-        // При новой попытке аренды нас скажут, что очередь пустая
+        // При новой попытке аренды в режиме Poll нам скажут, что очередь пустая
         tx_sock(GlobalReq::Lend { timeout: 500, mode: LendMode::Poll, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::QueueEmpty);
 
@@ -1197,21 +1197,46 @@ mod test {
             let value = (SteadyTime::now() - t).num_milliseconds();
             ((value + variance) / expected) * expected
         }
+
         let t_start_a = SteadyTime::now();
+
+        // Пытаемся арендовать новое значение в блокирующем режиме, нам должно прилететь значение по ключу A
+        // так как оно имеет меньший таймаут
         tx_sock(GlobalReq::Lend { timeout: 500, mode: LendMode::Block, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Lent { lend_key: 7, key: key_a.clone(), value: value_b, });
+
+        // Ожидание аренды не должно занять больше 1000 milliSec
         assert_eq!(round_ms(t_start_a, 1000, 100), 1000);
-        tx_sock(GlobalReq::Count, sock); assert_eq!(rx_sock(sock), GlobalRep::Counted(0));
-        tx_sock(GlobalReq::Update(key_a.clone(), value_a.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::Updated);
-        tx_sock(GlobalReq::Heartbeat { lend_key: 7, key: key_a.clone(), timeout: 1000, }, sock); assert_eq!(rx_sock(sock), GlobalRep::Heartbeaten);
+
+        // Элементов нету в очереди
+        tx_sock(GlobalReq::Count, sock); 
+        assert_eq!(rx_sock(sock), GlobalRep::Counted(0));
+        
+        // Обновляем значение по ключу A
+        tx_sock(GlobalReq::Update(key_a.clone(), value_a.clone()), sock); 
+        assert_eq!(rx_sock(sock), GlobalRep::Updated);
+
+        // TODO: Обновляем аренду по ключу A?
+        tx_sock(GlobalReq::Heartbeat { lend_key: 7, key: key_a.clone(), timeout: 1000, }, sock); 
+        assert_eq!(rx_sock(sock), GlobalRep::Heartbeaten);
+
         let t_start_b = SteadyTime::now();
+
+        // Арендуем значение и получаем A
         tx_sock(GlobalReq::Lend { timeout: 500, mode: LendMode::Block, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Lent { lend_key: 8, key: key_a.clone(), value: value_a.clone(), });
+
+        // Время ожидания новой аренды не должно превышать снова 1000 milliSec
         assert_eq!(round_ms(t_start_b, 1000, 100), 1000);
+
+        // Возвращаем арендованное значение в очереди вручную
         tx_sock(GlobalReq::Repay { lend_key: 8, key: key_a.clone(), value: value_a.clone(), status: RepayStatus::Penalty, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Repaid);
+
+        // При повторной попытке возврата будет ошибка, что нечего возвращать
         tx_sock(GlobalReq::Repay { lend_key: 8, key: key_a, value: value_a, status: RepayStatus::Penalty, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::NotFound);
+
         tx_sock(GlobalReq::Stats, sock);
         assert_eq!(rx_sock(sock),
                    GlobalRep::StatsGot {

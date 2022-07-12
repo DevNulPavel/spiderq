@@ -201,6 +201,7 @@ pub enum PqLocalReq {
     NextTrigger,
     /// Ставим в очередь новый элемент
     Enqueue(Key, AddMode),
+    /// TODO: Арендуем в очереди место
     LendUntil(u64, SteadyTime, LendMode),
     RepayTimedOut,
     Heartbeat(u64, Key, SteadyTime),
@@ -1086,48 +1087,111 @@ mod test {
 
     #[test]
     fn server() {
+        // TODO: Рабочая директория для сервера?
         let path = "/tmp/spiderq_server";
         let _ = fs::remove_dir_all(path);
+        // Адрес нашего внешнего сокета только внутри процесса
         let zmq_addr = "inproc://server";
+        // Стартуем сервер очередей
         let (ctx, master_thread) = entrypoint(zmq_addr, path, 16).unwrap();
+        
+        // Создаем сокет запросов к серверу
         let mut sock_ftd = ctx.socket(zmq::REQ).unwrap();
+        // Подключаемся к серверу
         sock_ftd.connect(zmq_addr).unwrap();
+
         let sock = &mut sock_ftd;
 
+        // Ping запрос делаем
         tx_sock(GlobalReq::Ping, sock); assert_eq!(rx_sock(sock), GlobalRep::Pong);
+
+        // Генерируем рандомные Key/Value и добавляем в очередь
         let ((key_a, value_a), (key_b, value_b), (key_c, value_c)) = (rnd_kv(), rnd_kv(), rnd_kv());
+
+        // Добавляем А
         tx_sock(GlobalReq::Add { key: key_a.clone(), value: value_a.clone(), mode: AddMode::Tail, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Added);
-        tx_sock(GlobalReq::Lookup(key_a.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::ValueFound(value_a.clone()));
-        tx_sock(GlobalReq::Lookup(key_b.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::ValueNotFound);
+
+        // Проверяем наличие значений по ключу А
+        tx_sock(GlobalReq::Lookup(key_a.clone()), sock); 
+        assert_eq!(rx_sock(sock), GlobalRep::ValueFound(value_a.clone()));
+
+        // По ключу B нету
+        tx_sock(GlobalReq::Lookup(key_b.clone()), sock); 
+        assert_eq!(rx_sock(sock), GlobalRep::ValueNotFound);
+
+        // Добавляем С
         tx_sock(GlobalReq::Add { key: key_c.clone(), value: value_c.clone(), mode: AddMode::Tail, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Added);
+
+        // При повторном добавлении возвращается Kept
         tx_sock(GlobalReq::Add { key: key_a.clone(), value: value_b.clone(), mode: AddMode::Tail, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Kept);
+
+        // Добавляем значение по ключу B
         tx_sock(GlobalReq::Add { key: key_b.clone(), value: value_b.clone(), mode: AddMode::Tail, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Added);
-        tx_sock(GlobalReq::Lookup(key_b.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::ValueFound(value_b.clone()));
-        tx_sock(GlobalReq::Lookup(key_c.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::ValueFound(value_c));
-        tx_sock(GlobalReq::Remove(key_c.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::Removed);
-        tx_sock(GlobalReq::Remove(key_c.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::NotRemoved);
-        tx_sock(GlobalReq::Lookup(key_c), sock); assert_eq!(rx_sock(sock), GlobalRep::ValueNotFound);
+
+        // Ищем по ключу B
+        tx_sock(GlobalReq::Lookup(key_b.clone()), sock); 
+        assert_eq!(rx_sock(sock), GlobalRep::ValueFound(value_b.clone()));
+        
+        // Ищем по ключу C
+        tx_sock(GlobalReq::Lookup(key_c.clone()), sock); 
+        assert_eq!(rx_sock(sock), GlobalRep::ValueFound(value_c));
+
+        // Удаляем по ключу С
+        tx_sock(GlobalReq::Remove(key_c.clone()), sock); 
+        assert_eq!(rx_sock(sock), GlobalRep::Removed);
+
+        // Повторная попытка удаления выдает NotRemoved
+        tx_sock(GlobalReq::Remove(key_c.clone()), sock); 
+        assert_eq!(rx_sock(sock), GlobalRep::NotRemoved);
+
+        // Ищем значение по ключу C
+        tx_sock(GlobalReq::Lookup(key_c), sock); 
+        assert_eq!(rx_sock(sock), GlobalRep::ValueNotFound);
+
+        // TODO: ???
+        // Арендуем слот с таймаутом 1000 милисекунд, получая A
         tx_sock(GlobalReq::Lend { timeout: 1000, mode: LendMode::Block, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Lent { lend_key: 4, key: key_a.clone(), value: value_a.clone(), });
+
+        // Арендуем еще одно значение с таймаутом 500 миллисекунд, получая B
         tx_sock(GlobalReq::Lend { timeout: 500, mode: LendMode::Block, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Lent { lend_key: 4, key: key_b.clone(), value: value_b.clone(), });
-        tx_sock(GlobalReq::Count, sock); assert_eq!(rx_sock(sock), GlobalRep::Counted(0));
+
+        // В очереди при этом у нас не остается элементов
+        tx_sock(GlobalReq::Count, sock); 
+        assert_eq!(rx_sock(sock), GlobalRep::Counted(0));
+
+        // При новой попытке аренды нас скажут, что очередь пустая
         tx_sock(GlobalReq::Lend { timeout: 500, mode: LendMode::Poll, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::QueueEmpty);
-        tx_sock(GlobalReq::Repay { lend_key: 4, key: key_b.clone(), value: value_a.clone(), status: RepayStatus::Penalty, }, sock);
+
+        // Возвращаем значение по ключу B назад
+        tx_sock(GlobalReq::Repay { lend_key: 4, key: key_b.clone(), value: value_a.clone(), status: RepayStatus::Penalty }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Repaid);
+
+        // Возвращаем значение по ключу A назад
         tx_sock(GlobalReq::Repay { lend_key: 4, key: key_a.clone(), value: value_b.clone(), status: RepayStatus::Penalty, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Repaid);
-        tx_sock(GlobalReq::Count, sock); assert_eq!(rx_sock(sock), GlobalRep::Counted(2));
+
+        // В очереди снова 2 элемента
+        tx_sock(GlobalReq::Count, sock); 
+        assert_eq!(rx_sock(sock), GlobalRep::Counted(2));
+
+        // Снова пробуем арендовать и получаем значение по ключу B
         tx_sock(GlobalReq::Lend { timeout: 10000, mode: LendMode::Block, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Lent { lend_key: 6, key: key_b, value: value_a.clone(), });
+
+        // Снова пробуем арендовать и получаем значение по ключу A
         tx_sock(GlobalReq::Lend { timeout: 1000, mode: LendMode::Block, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Lent { lend_key: 6, key: key_a.clone(), value: value_b.clone(), });
-        tx_sock(GlobalReq::Count, sock); assert_eq!(rx_sock(sock), GlobalRep::Counted(0));
+
+        // Снова нет элементов в очереди
+        tx_sock(GlobalReq::Count, sock); 
+        assert_eq!(rx_sock(sock), GlobalRep::Counted(0));
 
         fn round_ms(t: SteadyTime, expected: i64, variance: i64) -> i64 {
             let value = (SteadyTime::now() - t).num_milliseconds();

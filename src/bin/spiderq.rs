@@ -1071,16 +1071,25 @@ mod test {
             });
     }
 
+    /// Отправляем данные в сокет
     fn tx_sock(packet: GlobalReq, sock: &mut zmq::Socket) {
+        // Размер данных
         let required = packet.encode_len();
+        // Создаем сообщение сразу нужной емкости
         let mut msg = zmq::Message::with_capacity(required).unwrap();
+        // Кодируем данные в сообщение
         packet.encode(&mut msg);
+        // Отсылаем
         sock.send_msg(msg, 0).unwrap();
     }
 
+    /// Получение данных из сокета и парсинг
     fn rx_sock(sock: &mut zmq::Socket) -> GlobalRep {
+        // Получаем новое сообщение
         let msg = sock.recv_msg(0).unwrap();
+        // Проверяем, что больше нету никаких сообщений в очереди еще
         assert!(!sock.get_rcvmore().unwrap());
+        // Парсим полученное сообщение
         let (rep, _) = GlobalRep::decode(&msg).unwrap();
         rep
     }
@@ -1152,8 +1161,8 @@ mod test {
         tx_sock(GlobalReq::Lookup(key_c), sock); 
         assert_eq!(rx_sock(sock), GlobalRep::ValueNotFound);
 
-        // TODO: ???
         // Арендуем слот с таймаутом 1000 милисекунд, получая A
+        // При этом блокируемся пока не будет нового значения
         tx_sock(GlobalReq::Lend { timeout: 1000, mode: LendMode::Block, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Lent { lend_key: 4, key: key_a.clone(), value: value_a.clone(), });
 
@@ -1216,7 +1225,7 @@ mod test {
         tx_sock(GlobalReq::Update(key_a.clone(), value_a.clone()), sock); 
         assert_eq!(rx_sock(sock), GlobalRep::Updated);
 
-        // TODO: Обновляем аренду по ключу A?
+        // Обновляем аренду по ключу A
         tx_sock(GlobalReq::Heartbeat { lend_key: 7, key: key_a.clone(), timeout: 1000, }, sock); 
         assert_eq!(rx_sock(sock), GlobalRep::Heartbeaten);
 
@@ -1237,6 +1246,7 @@ mod test {
         tx_sock(GlobalReq::Repay { lend_key: 8, key: key_a, value: value_a, status: RepayStatus::Penalty, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::NotFound);
 
+        // Получаем статистику по работе очереди
         tx_sock(GlobalReq::Stats, sock);
         assert_eq!(rx_sock(sock),
                    GlobalRep::StatsGot {
@@ -1250,7 +1260,11 @@ mod test {
                        repay: 4,
                        heartbeat: 1,
                        stats: 1, });
+
+        // Отправляем событие завершения работы
         tx_sock(GlobalReq::Terminate, sock); assert_eq!(rx_sock(sock), GlobalRep::Terminated);
+
+        // Ждем заверешения
         master_thread.join().unwrap();
     }
 }

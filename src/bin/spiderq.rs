@@ -96,25 +96,50 @@ pub fn bootstrap(maybe_matches: getopts::Result) -> Result<(zmq::Context, JoinHa
 
         println!(" ;; {:?} received, terminating server...", signals);
 
-        // Создаем ProtoBuf сообщение с запросом завершения работы
-        let packet = GlobalReq::Terminate;
-        let required = packet.encode_len();
-        let mut msg = zmq::Message::with_capacity(required)
-            .map_err(ZmqError::Message)
-            .unwrap();
-        packet.encode(&mut msg);
+        {
+            // Создаем ProtoBuf сообщение с запросом сброса всего на диск
+            let packet = GlobalReq::Flush;
+            let required = packet.encode_len();
+            let mut msg = zmq::Message::with_capacity(required)
+                .map_err(ZmqError::Message)
+                .unwrap();
+            packet.encode(&mut msg);
 
-        // Отправляем в ZMQ сообщение завершения работы
-        sock.send_msg(msg, 0).unwrap();
+            // Отправляем в ZMQ сообщение завершения работы
+            sock.send_msg(msg, 0).unwrap();
 
-        // Затем ждем ответный статус
-        let reply_msg = sock.recv_msg(0).map_err(ZmqError::Recv).unwrap();
-        let (rep, _) = GlobalRep::decode(&reply_msg).unwrap();
+            // Затем ждем ответный статус
+            let reply_msg = sock.recv_msg(0).map_err(ZmqError::Recv).unwrap();
+            let (rep, _) = GlobalRep::decode(&reply_msg).unwrap();
 
-        // Если успешно все завершилось - тогда все ок, если нет - паникуем
-        match rep {
-            GlobalRep::Terminated => (),
-            other => panic!("unexpected reply for terminate: {:?}", other),
+            // Проверяем результат
+            match rep {
+                GlobalRep::Flushed => (),
+                other => panic!("unexpected reply for flush: {:?}", other),
+            }
+        }
+
+        {
+            // Создаем ProtoBuf сообщение с запросом завершения работы
+            let packet = GlobalReq::Terminate;
+            let required = packet.encode_len();
+            let mut msg = zmq::Message::with_capacity(required)
+                .map_err(ZmqError::Message)
+                .unwrap();
+            packet.encode(&mut msg);
+
+            // Отправляем в ZMQ сообщение завершения работы
+            sock.send_msg(msg, 0).unwrap();
+
+            // Затем ждем ответный статус
+            let reply_msg = sock.recv_msg(0).map_err(ZmqError::Recv).unwrap();
+            let (rep, _) = GlobalRep::decode(&reply_msg).unwrap();
+
+            // Если успешно все завершилось - тогда все ок, если нет - паникуем
+            match rep {
+                GlobalRep::Terminated => (),
+                other => panic!("unexpected reply for terminate: {:?}", other),
+            }
         }
     });
 
